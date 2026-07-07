@@ -1,0 +1,5 @@
+# Extras opcionales (el asistente funciona sin ellos, pero mejoran mucho):
+ddgs                    # busqueda web
+sentence-transformers   # memoria semantica (descarga modelo ~90MB la 1ra vez)
+numpy
+openai-whisper          # notas de voz por Telegram (requiere ffmpeg del sistema)
