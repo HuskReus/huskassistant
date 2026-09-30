@@ -108,6 +108,11 @@ para ver la tasa de acierto.
 
 ## Uso
 
+**Windows:** doble clic en `radar.bat` (la primera vez te abre `.env` para poner
+tus datos de Telegram). Para un solo ciclo de prueba: `radar.bat --once`.
+
+**Linux/VPS:**
+
 ```bash
 python huskagent.py            # bucle continuo (cada 8 min)
 python huskagent.py --once     # un solo ciclo, para probar

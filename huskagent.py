@@ -32,6 +32,23 @@ from typing import Optional
 import requests
 
 # --------------------------------------------------------------------------- #
+# .env — misma carga simple que agent.py (así funciona igual en Windows)
+# --------------------------------------------------------------------------- #
+def _load_env():
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            os.environ.setdefault(k.strip(), v.strip())
+
+_load_env()
+
+# --------------------------------------------------------------------------- #
 # CONFIG
 # --------------------------------------------------------------------------- #
 CONFIG = {
