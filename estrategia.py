@@ -220,8 +220,15 @@ def enviar_telegram(texto: str):
     if not token or not chat:
         print("(Falta TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID; no se envió)")
         return
-    requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                  json={"chat_id": chat, "text": texto}, timeout=15)
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          json={"chat_id": chat, "text": texto}, timeout=15)
+        if r.ok:
+            print("(Enviado a Telegram)")
+        else:
+            print(f"(Telegram rechazó el mensaje: {r.json().get('description', r.status_code)})")
+    except requests.RequestException as e:
+        print(f"(No pude conectar con Telegram: {e})")
 
 
 # --------------------------------------------------------------------------- #
