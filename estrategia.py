@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""
+Estrategia de tendencia con control de volatilidad (spot, solo largos, sin apalancamiento).
+
+Reglas (se evalúan una vez al día, con el cierre diario UTC):
+  1. Filtro de tendencia: un activo solo se mantiene si su cierre > SMA(sma_dias).
+     Si está por debajo -> 100% en stablecoin (efectivo) para ese activo.
+  2. Tamaño por volatilidad: peso = min(1, vol_objetivo / vol_realizada_30d),
+     repartido en partes iguales entre los activos del universo.
+     Cuando el mercado se pone violento, se reduce la exposición sola.
+  3. Anti-comisiones: solo se rebalancea si el peso cambia más de `umbral_rebalanceo`.
+
+No promete ganancias: busca capturar las tendencias alcistas largas de cripto y
+esquivar la mayor parte de los mercados bajistas (-75%/-85% en BTC/ETH). A cambio,
+pierde en mercados laterales (entradas y salidas falsas) y siempre llega tarde.
+
+Igual que huskagent.py: NUNCA ejecuta órdenes ni toca llaves. Solo calcula y avisa.
+
+Uso:
+  python estrategia.py backtest            # backtest con datos reales de Binance
+  python estrategia.py senal               # posición recomendada para hoy
+  python estrategia.py senal --telegram    # ... y la manda a tu bot
+  python estrategia.py backtest --sintetico  # prueba offline con datos simulados
+"""
+
+import os
+import sys
+import math
+import random
+import argparse
+import datetime as dt
+
+import requests
+
+CONFIG = {
+    "activos": ["BTCUSDT", "ETHUSDT"],
+    "sma_dias": 100,              # filtro de tendencia
+    "vol_dias": 30,               # ventana de volatilidad realizada
+    "vol_objetivo": 0.50,         # 50% anualizada por activo (BTC suele estar en 40-80%)
+    "umbral_rebalanceo": 0.20,    # no mover menos de 20 puntos de peso (menos comisiones)
+    "comision": 0.001,            # 0.10% por lado (Binance spot sin BNB)
+    "desde": "2018-01-01",
+}
+
+BINANCE_HOSTS = ["https://api.binance.com", "https://data-api.binance.vision"]
+
+
+# --------------------------------------------------------------------------- #
+# DATOS
+# --------------------------------------------------------------------------- #
+def descargar_cierres(simbolo: str, desde: str) -> list[tuple[dt.date, float]]:
+    """Cierres diarios de Binance (API pública, sin llave)."""
+    inicio_ms = int(dt.datetime.fromisoformat(desde).replace(tzinfo=dt.timezone.utc).timestamp() * 1000)
+    ultimo_error = None
+    for host in BINANCE_HOSTS:
+        try:
+            filas, cursor = [], inicio_ms
+            while True:
+                r = requests.get(f"{host}/api/v3/klines", timeout=20, params={
+                    "symbol": simbolo, "interval": "1d", "startTime": cursor, "limit": 1000})
+                r.raise_for_status()
+                lote = r.json()
+                if not lote:
+                    break
+                filas.extend(lote)
+                if len(lote) < 1000:
+                    break
+                cursor = lote[-1][0] + 86_400_000
+            hoy = dt.datetime.now(dt.timezone.utc).date()
+            datos = [(dt.datetime.fromtimestamp(k[0] / 1000, dt.timezone.utc).date(), float(k[4])) for k in filas]
+            return [(d, c) for d, c in datos if d < hoy]  # descarta la vela de hoy (aún abierta)
+        except requests.RequestException as e:
+            ultimo_error = e
+    raise RuntimeError(f"No pude descargar {simbolo}: {ultimo_error}")
+
+
+def cierres_sinteticos(simbolo: str, dias: int = 2500) -> list[tuple[dt.date, float]]:
+    """Serie simulada con regímenes alcistas/bajistas, solo para probar el código offline."""
+    rng = random.Random(sum(map(ord, simbolo)))
+    precio, deriva, fecha = 10_000.0, 0.0, dt.date(2019, 1, 1)
+    serie = []
+    for i in range(dias):
+        if i % 250 == 0:
+            deriva = rng.choice([0.004, -0.003, 0.0])
+        precio *= math.exp(deriva + rng.gauss(0, 0.035))
+        serie.append((fecha + dt.timedelta(days=i), precio))
+    return serie
+
+
+def alinear(series: dict[str, list[tuple[dt.date, float]]]):
+    """Deja solo las fechas que tienen todos los activos."""
+    comunes = set.intersection(*(set(d for d, _ in s) for s in series.values()))
+    fechas = sorted(comunes)
+    precios = {sym: dict(s) for sym, s in series.items()}
+    return fechas, {sym: [precios[sym][d] for d in fechas] for sym in series}
+
+
+# --------------------------------------------------------------------------- #
+# SEÑAL
+# --------------------------------------------------------------------------- #
+def peso_objetivo(cierres: list[float], i: int, cfg: dict) -> float:
+    """Peso (0..1) de UN activo al cierre del día i, usando solo datos hasta i."""
+    n_sma, n_vol = cfg["sma_dias"], cfg["vol_dias"]
+    if i < max(n_sma, n_vol + 1) - 1:
+        return 0.0
+    sma = sum(cierres[i - n_sma + 1:i + 1]) / n_sma
+    if cierres[i] <= sma:
+        return 0.0
+    rets = [math.log(cierres[j] / cierres[j - 1]) for j in range(i - n_vol + 1, i + 1)]
+    media = sum(rets) / n_vol
+    vol = math.sqrt(sum((r - media) ** 2 for r in rets) / (n_vol - 1)) * math.sqrt(365)
+    return min(1.0, cfg["vol_objetivo"] / vol) if vol > 0 else 0.0
+
+
+# --------------------------------------------------------------------------- #
+# BACKTEST
+# --------------------------------------------------------------------------- #
+def backtest(fechas, precios: dict[str, list[float]], cfg: dict) -> dict:
+    activos = list(precios)
+    parte = 1.0 / len(activos)
+    pesos = {a: 0.0 for a in activos}
+    equity, bh = [1.0], [1.0]
+    operaciones, costo_total = 0, 0.0
+
+    for i in range(len(fechas) - 1):
+        # 1) decidir con el cierre de hoy
+        for a in activos:
+            objetivo = peso_objetivo(precios[a], i, cfg) * parte
+            if abs(objetivo - pesos[a]) >= cfg["umbral_rebalanceo"] * parte or (objetivo == 0 < pesos[a]):
+                costo = abs(objetivo - pesos[a]) * cfg["comision"]
+                equity[-1] *= (1 - costo)
+                costo_total += costo
+                operaciones += 1
+                pesos[a] = objetivo
+        # 2) aplicar el retorno de mañana (sin mirar al futuro)
+        r_port = sum(pesos[a] * (precios[a][i + 1] / precios[a][i] - 1) for a in activos)
+        r_bh = sum(parte * (precios[a][i + 1] / precios[a][i] - 1) for a in activos)
+        equity.append(equity[-1] * (1 + r_port))
+        bh.append(bh[-1] * (1 + r_bh))
+        # los pesos derivan con el precio
+        total = 1 + r_port
+        for a in activos:
+            pesos[a] = pesos[a] * (precios[a][i + 1] / precios[a][i]) / total
+
+    return {"fechas": fechas, "estrategia": metricas(equity), "buy_hold": metricas(bh),
+            "operaciones": operaciones, "costo_total": costo_total, "pesos_hoy": pesos}
+
+
+def metricas(curva: list[float]) -> dict:
+    años = (len(curva) - 1) / 365
+    rets = [curva[i] / curva[i - 1] - 1 for i in range(1, len(curva))]
+    media = sum(rets) / len(rets)
+    desv = math.sqrt(sum((r - media) ** 2 for r in rets) / (len(rets) - 1))
+    pico, max_dd = curva[0], 0.0
+    for v in curva:
+        pico = max(pico, v)
+        max_dd = min(max_dd, v / pico - 1)
+    cagr = curva[-1] ** (1 / años) - 1 if años > 0 else 0.0
+    return {
+        "multiplo": curva[-1],
+        "cagr": cagr,
+        "max_drawdown": max_dd,
+        "sharpe": (media / desv) * math.sqrt(365) if desv > 0 else 0.0,
+        "calmar": cagr / abs(max_dd) if max_dd < 0 else 0.0,
+    }
+
+
+def imprimir_reporte(res: dict):
+    f = res["fechas"]
+    print(f"\nPeriodo: {f[0]} -> {f[-1]}  ({len(f)} días)")
+    print(f"{'':14}{'Estrategia':>12}{'Buy & Hold':>12}")
+    for clave, etiqueta, fmt in [("multiplo", "Múltiplo", "{:.2f}x"), ("cagr", "CAGR", "{:.1%}"),
+                                 ("max_drawdown", "Máx. caída", "{:.1%}"), ("sharpe", "Sharpe", "{:.2f}"),
+                                 ("calmar", "Calmar", "{:.2f}")]:
+        e, b = res["estrategia"][clave], res["buy_hold"][clave]
+        print(f"{etiqueta:14}{fmt.format(e):>12}{fmt.format(b):>12}")
+    print(f"\nOperaciones: {res['operaciones']}  |  comisiones pagadas: {res['costo_total']:.2%} del capital")
+
+
+# --------------------------------------------------------------------------- #
+# SEÑAL DE HOY
+# --------------------------------------------------------------------------- #
+def senal_hoy(fechas, precios: dict[str, list[float]], cfg: dict) -> str:
+    i = len(fechas) - 1
+    parte = 1.0 / len(precios)
+    lineas = [f"📈 Estrategia de tendencia — cierre {fechas[i]}"]
+    efectivo = 1.0
+    for a, cierres in precios.items():
+        n = cfg["sma_dias"]
+        sma = sum(cierres[i - n + 1:i + 1]) / n
+        peso = peso_objetivo(cierres, i, cfg) * parte
+        efectivo -= peso
+        estado = "ALCISTA" if cierres[i] > sma else "bajista"
+        lineas.append(f"• {a}: {cierres[i]:,.2f} vs SMA{n} {sma:,.2f} ({estado}) -> {peso:.0%} del capital")
+    lineas.append(f"• Stablecoin/efectivo: {efectivo:.0%}")
+    lineas.append("Solo es una señal. Tú decides y ejecutas.")
+    return "\n".join(lineas)
+
+
+def enviar_telegram(texto: str):
+    token, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        print("(Falta TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID; no se envió)")
+        return
+    requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                  json={"chat_id": chat, "text": texto}, timeout=15)
+
+
+def main():
+    p = argparse.ArgumentParser(description="Estrategia de tendencia cripto (solo señales)")
+    p.add_argument("modo", choices=["backtest", "senal"])
+    p.add_argument("--sintetico", action="store_true", help="usar datos simulados (sin internet)")
+    p.add_argument("--telegram", action="store_true", help="enviar la señal a Telegram")
+    p.add_argument("--sma", type=int, help="días de la media móvil (defecto 100)")
+    args = p.parse_args()
+
+    cfg = dict(CONFIG)
+    if args.sma:
+        cfg["sma_dias"] = args.sma
+    fuente = cierres_sinteticos if args.sintetico else (lambda s: descargar_cierres(s, cfg["desde"]))
+    fechas, precios = alinear({a: fuente(a) for a in cfg["activos"]})
+
+    if args.modo == "backtest":
+        imprimir_reporte(backtest(fechas, precios, cfg))
+    else:
+        texto = senal_hoy(fechas, precios, cfg)
+        print(texto)
+        if args.telegram:
+            enviar_telegram(texto)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
