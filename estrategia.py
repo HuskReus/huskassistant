@@ -20,13 +20,16 @@ Uso:
   python estrategia.py backtest            # backtest con datos reales de Binance
   python estrategia.py senal               # posición recomendada para hoy
   python estrategia.py senal --telegram    # ... y la manda a tu bot
+  python estrategia.py papel --telegram    # avanza la cartera simulada en vivo (1 vez al día)
   python estrategia.py backtest --sintetico  # prueba offline con datos simulados
 """
 
 import os
 import sys
 import math
+import json
 import random
+import sqlite3
 import argparse
 import datetime as dt
 
@@ -41,6 +44,9 @@ CONFIG = {
     "comision": 0.001,            # 0.10% por lado (Binance spot sin BNB)
     "desde": "2018-01-01",
 }
+
+DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(DIR, "estrategia.db")
 
 BINANCE_HOSTS = ["https://api.binance.com", "https://data-api.binance.vision"]
 
@@ -115,6 +121,25 @@ def peso_objetivo(cierres: list[float], i: int, cfg: dict) -> float:
 # --------------------------------------------------------------------------- #
 # BACKTEST
 # --------------------------------------------------------------------------- #
+def rebalancear(pesos: dict, historia: dict[str, list[float]], cfg: dict):
+    """Aplica las reglas al último cierre de `historia`. Devuelve (pesos, costo, cambios)."""
+    parte = 1.0 / len(historia)
+    nuevos, costo, cambios = dict(pesos), 0.0, {}
+    for a, cierres in historia.items():
+        objetivo = peso_objetivo(cierres, len(cierres) - 1, cfg) * parte
+        if abs(objetivo - pesos[a]) >= cfg["umbral_rebalanceo"] * parte or (objetivo == 0 < pesos[a]):
+            costo += abs(objetivo - pesos[a]) * cfg["comision"]
+            cambios[a] = (pesos[a], objetivo)
+            nuevos[a] = objetivo
+    return nuevos, costo, cambios
+
+
+def derivar(pesos: dict, crecimiento: dict) -> tuple[dict, float]:
+    """Mueve el portafolio con los precios. Devuelve (pesos nuevos, retorno del periodo)."""
+    r = sum(pesos[a] * (crecimiento[a] - 1) for a in pesos)
+    return {a: pesos[a] * crecimiento[a] / (1 + r) for a in pesos}, r
+
+
 def backtest(fechas, precios: dict[str, list[float]], cfg: dict) -> dict:
     activos = list(precios)
     parte = 1.0 / len(activos)
@@ -124,23 +149,16 @@ def backtest(fechas, precios: dict[str, list[float]], cfg: dict) -> dict:
 
     for i in range(len(fechas) - 1):
         # 1) decidir con el cierre de hoy
-        for a in activos:
-            objetivo = peso_objetivo(precios[a], i, cfg) * parte
-            if abs(objetivo - pesos[a]) >= cfg["umbral_rebalanceo"] * parte or (objetivo == 0 < pesos[a]):
-                costo = abs(objetivo - pesos[a]) * cfg["comision"]
-                equity[-1] *= (1 - costo)
-                costo_total += costo
-                operaciones += 1
-                pesos[a] = objetivo
+        pesos, costo, cambios = rebalancear(pesos, {a: precios[a][:i + 1] for a in activos}, cfg)
+        equity[-1] *= (1 - costo)
+        costo_total += costo
+        operaciones += len(cambios)
         # 2) aplicar el retorno de mañana (sin mirar al futuro)
-        r_port = sum(pesos[a] * (precios[a][i + 1] / precios[a][i] - 1) for a in activos)
-        r_bh = sum(parte * (precios[a][i + 1] / precios[a][i] - 1) for a in activos)
+        crec = {a: precios[a][i + 1] / precios[a][i] for a in activos}
+        pesos, r_port = derivar(pesos, crec)
+        r_bh = sum(parte * (crec[a] - 1) for a in activos)
         equity.append(equity[-1] * (1 + r_port))
         bh.append(bh[-1] * (1 + r_bh))
-        # los pesos derivan con el precio
-        total = 1 + r_port
-        for a in activos:
-            pesos[a] = pesos[a] * (precios[a][i + 1] / precios[a][i]) / total
 
     return {"fechas": fechas, "estrategia": metricas(equity), "buy_hold": metricas(bh),
             "operaciones": operaciones, "costo_total": costo_total, "pesos_hoy": pesos}
@@ -202,17 +220,108 @@ def enviar_telegram(texto: str):
     if not token or not chat:
         print("(Falta TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID; no se envió)")
         return
-    requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                  json={"chat_id": chat, "text": texto}, timeout=15)
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          json={"chat_id": chat, "text": texto}, timeout=15)
+        if r.ok:
+            print("(Enviado a Telegram)")
+        else:
+            print(f"(Telegram rechazó el mensaje: {r.json().get('description', r.status_code)})")
+    except requests.RequestException as e:
+        print(f"(No pude conectar con Telegram: {e})")
+
+
+# --------------------------------------------------------------------------- #
+# SEGUIMIENTO EN VIVO (paper trading)
+# --------------------------------------------------------------------------- #
+class Papel:
+    """Cartera simulada que avanza un día por ejecución y se guarda en estrategia.db."""
+
+    def __init__(self, path: str = DB_PATH):
+        self.db = sqlite3.connect(path)
+        self.db.execute("""CREATE TABLE IF NOT EXISTS dias (
+            fecha TEXT PRIMARY KEY, precios TEXT, pesos TEXT,
+            equity REAL, buy_hold REAL, operaciones TEXT)""")
+
+    def dias(self) -> list[tuple]:
+        return self.db.execute(
+            "SELECT fecha, precios, pesos, equity, buy_hold, operaciones FROM dias ORDER BY fecha").fetchall()
+
+    def avanzar(self, fechas, precios: dict[str, list[float]], cfg: dict, capital: float) -> tuple[bool, dict]:
+        """Registra el último cierre. Devuelve (hubo_dia_nuevo, cambios de posición)."""
+        hoy = fechas[-1].isoformat()
+        filas = self.dias()
+        if filas and filas[-1][0] >= hoy:
+            return False, {}
+        activos = list(precios)
+        cierre = {a: precios[a][-1] for a in activos}
+        if filas:
+            _, p_ant, w_ant, equity, bh, _ = filas[-1]
+            p_ant, w_ant = json.loads(p_ant), json.loads(w_ant)
+            crec = {a: cierre[a] / p_ant[a] for a in activos}
+            pesos, r = derivar(w_ant, crec)
+            equity *= 1 + r
+            bh *= 1 + sum(crec[a] - 1 for a in activos) / len(activos)
+        else:
+            pesos, equity, bh = {a: 0.0 for a in activos}, capital, capital
+        pesos, costo, cambios = rebalancear(pesos, precios, cfg)
+        equity *= 1 - costo
+        self.db.execute("INSERT INTO dias VALUES (?,?,?,?,?,?)",
+                        (hoy, json.dumps(cierre), json.dumps(pesos), equity, bh, json.dumps(cambios)))
+        self.db.commit()
+        return True, cambios
+
+    def reporte(self, cambios: dict) -> str:
+        filas = self.dias()
+        if not filas:
+            return "Seguimiento en vivo: todavía sin datos."
+        inicio, ultimo = filas[0], filas[-1]
+        curva = [f[3] for f in filas]
+        pico, max_dd = curva[0], 0.0
+        for v in curva:
+            pico = max(pico, v)
+            max_dd = min(max_dd, v / pico - 1)
+        pesos = json.loads(ultimo[2])
+        lineas = [
+            f"🧪 Seguimiento en vivo (papel) — cierre {ultimo[0]}",
+            f"Desde {inicio[0]} ({len(filas)} días registrados)",
+            f"• Estrategia: {ultimo[3]:,.2f} ({ultimo[3] / inicio[3] - 1:+.1%})",
+            f"• Buy & hold: {ultimo[4]:,.2f} ({ultimo[4] / inicio[4] - 1:+.1%})",
+            f"• Máx. caída de la estrategia: {max_dd:.1%}",
+            "Posición actual: " + ", ".join(f"{a} {w:.0%}" for a, w in pesos.items())
+            + f", efectivo {1 - sum(pesos.values()):.0%}",
+        ]
+        for a, (antes, despues) in cambios.items():
+            accion = "COMPRAR" if despues > antes else "VENDER"
+            lineas.append(f"⚠️ {accion} {a}: de {antes:.0%} a {despues:.0%} del capital")
+        if not cambios:
+            lineas.append("Sin cambios hoy: mantener.")
+        return "\n".join(lineas)
+
+
+def cargar_env(path: str = os.path.join(DIR, ".env")):
+    """Lee .env (KEY=valor) sin pisar variables ya definidas."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            for linea in f:
+                linea = linea.strip()
+                if linea and not linea.startswith("#") and "=" in linea:
+                    k, v = linea.split("=", 1)
+                    os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    except FileNotFoundError:
+        pass
 
 
 def main():
     p = argparse.ArgumentParser(description="Estrategia de tendencia cripto (solo señales)")
-    p.add_argument("modo", choices=["backtest", "senal"])
+    p.add_argument("modo", choices=["backtest", "senal", "papel"])
     p.add_argument("--sintetico", action="store_true", help="usar datos simulados (sin internet)")
     p.add_argument("--telegram", action="store_true", help="enviar la señal a Telegram")
     p.add_argument("--sma", type=int, help="días de la media móvil (defecto 100)")
+    p.add_argument("--capital", type=float, default=1000.0, help="capital simulado inicial en papel")
+    p.add_argument("--db", default=DB_PATH, help="base de datos del seguimiento en papel")
     args = p.parse_args()
+    cargar_env()
 
     cfg = dict(CONFIG)
     if args.sma:
@@ -222,6 +331,15 @@ def main():
 
     if args.modo == "backtest":
         imprimir_reporte(backtest(fechas, precios, cfg))
+    elif args.modo == "papel":
+        papel = Papel(args.db)
+        nuevo, cambios = papel.avanzar(fechas, precios, cfg, args.capital)
+        texto = papel.reporte(cambios)
+        if not nuevo:
+            texto += "\n(Este cierre ya estaba registrado; no se simuló nada nuevo.)"
+        print(texto)
+        if args.telegram and nuevo:
+            enviar_telegram(texto)
     else:
         texto = senal_hoy(fechas, precios, cfg)
         print(texto)
