@@ -74,5 +74,6 @@ Serio: servicio systemd (pídelo y te doy el archivo).
 | `api.py`         | La cara HTTP que sirve la PWA                    |
 | `assistant.html` | La app instalable del celular                    |
 | `huskagent.py`   | Tu radar de tokens (independiente, misma carpeta)|
+| `estrategia.py`  | Estrategia de tendencia BTC/ETH: backtest y señal diaria (ver `ESTRATEGIA.md`) |
 | `start.sh/.bat`  | Arranque en un comando                           |
 | `.env`           | Tus llaves (créalo desde `.env.example`)         |
