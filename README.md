@@ -73,7 +73,7 @@ Serio: servicio systemd (pídelo y te doy el archivo).
 | `agent.py`       | El cerebro (Telegram, skills, memoria, updates)  |
 | `api.py`         | La cara HTTP que sirve la PWA                    |
 | `assistant.html` | La app instalable del celular                    |
-| `huskagent.py`   | Tu radar de tokens (independiente, misma carpeta)|
+| `huskagent.py`   | Radar de tokens nuevos: filtros anti-rug, puntuación y alertas de salida (ver `ESTRATEGIA_TOKENS_NUEVOS.md`) |
 | `estrategia.py`  | Estrategia de tendencia BTC/ETH: backtest y señal diaria (ver `ESTRATEGIA.md`) |
 | `start.sh/.bat`  | Arranque en un comando                           |
 | `.env`           | Tus llaves (créalo desde `.env.example`)         |
